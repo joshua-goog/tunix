@@ -20,12 +20,14 @@ an LLM-based agent and an environment. It supports single and concurrent
 multi-pair trajectory collection.
 """
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import inspect
 import json
 import time
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, TYPE_CHECKING, Tuple
 
 from absl import logging
 import numpy as np
@@ -37,6 +39,20 @@ from tunix.rl.agentic.agents import agent_types
 from tunix.rl.agentic.agents import base_agent
 from tunix.rl.agentic.environments import base_environment
 from tunix.rl.rollout import base_rollout
+
+if TYPE_CHECKING:
+  from tunix.experimental.trajectory import converter as converter_lib  # pylint: disable=g-import-not-at-top
+  from tunix.experimental.trajectory import store as store_lib  # pylint: disable=g-import-not-at-top
+  from tunix.experimental.trajectory import trajectory as trajectory_lib  # pylint: disable=g-import-not-at-top
+else:
+  try:
+    from tunix.experimental.trajectory import converter as converter_lib  # pylint: disable=g-import-not-at-top
+    from tunix.experimental.trajectory import store as store_lib  # pylint: disable=g-import-not-at-top
+    from tunix.experimental.trajectory import trajectory as trajectory_lib  # pylint: disable=g-import-not-at-top
+  except ImportError:
+    converter_lib = None
+    store_lib = None
+    trajectory_lib = None
 
 BaseTaskEnv = base_environment.BaseTaskEnv
 ConversationAgentBase = base_agent.ConversationAgentBase
@@ -71,6 +87,9 @@ class TrajectoryCollectEngine:
       overlong_filter: bool = False,
       perf_v2: Optional[perf_tracer_v2.Tracer] = None,
       exact_token_continuity: bool = False,
+      policy_version: Optional[int] = None,
+      trajectory_store: Optional[store_lib.TrajectoryWriter] = None,
+      metadata: Optional[trajectory_lib.TrajectoryMetadata] = None,
   ):
     """Initialize the trajectory collection engine.
 
@@ -99,10 +118,18 @@ class TrajectoryCollectEngine:
           to use for performance measurements. Defaults to a no-op tracer.
         exact_token_continuity: Preserve recorded token history on later turns.
           Requires a token-aware model_call, tokenizer, and parser.
+        policy_version: Optional policy version integer to pass down for
+          trajectory and performance tracing.
+        trajectory_store: Optional TrajectoryWriter to write trajectory steps
+          to.
+        metadata: Optional TrajectoryMetadata for the current episode.
     """
     self.agent = agent
     self.env = env
     self.model_call = model_call
+    self.policy_version = policy_version
+    self.trajectory_store = trajectory_store
+    self.metadata = metadata
     self.final_reward_fn = None
     self.model_call_kwargs = model_call_kwargs or {}
     if exact_token_continuity and (tokenizer is None or chat_parser is None):
@@ -225,6 +252,119 @@ class TrajectoryCollectEngine:
           [final_step.assistant_routed_experts, pad], axis=0
       )
 
+  def _sync_trajectory_metadata(self) -> None:
+    """Syncs metadata status and agent trajectory timing/reward in place."""
+    if self.trajectory_store is None or self.metadata is None:
+      return
+    try:
+      converter_lib.update_trajectory_metadata(
+          metadata=self.metadata,
+          agent=self.agent,
+          policy_version=self.policy_version,
+          env_time=self.env_time,
+          reward_time=self.reward_time,
+      )
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.warning(
+          "%s Failed to sync trajectory metadata.",
+          self._debug_prefix,
+          exc_info=True,
+      )
+
+  def record_metadata(self) -> None:
+    """Syncs and updates trajectory metadata in trajectory_store."""
+    if self.trajectory_store is None or self.metadata is None:
+      return
+    try:
+      self._sync_trajectory_metadata()
+      self.trajectory_store.update_metadata(self.metadata)
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.warning(
+          "%s Failed to update trajectory metadata in store.",
+          self._debug_prefix,
+          exc_info=True,
+      )
+
+  def _record_task_step(self) -> None:
+    """Writes the initial task step (step 0) live to trajectory_store."""
+    if self.trajectory_store is None or self.metadata is None:
+      return
+    try:
+      self._sync_trajectory_metadata()
+      task = self.agent.trajectory.task or getattr(self.env, "task", None)
+      task_step = converter_lib.create_task_step(task)
+      if task_step is None:
+        user_msg = ""
+        for msg in self.agent.chat_completions or []:
+          if isinstance(msg, dict) and msg.get("role") == "user":
+            user_msg = str(msg.get("content") or "")
+            break
+        if not user_msg and task is not None:
+          user_msg = str(task)
+        task_step = trajectory_lib.TunixEnvStep(
+            step_id=0,
+            source=trajectory_lib.Source.USER,
+            message=user_msg,
+        )
+      self.trajectory_store.add_step(task_step, self.metadata)
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.warning(
+          "%s Failed to record task step in trajectory store.",
+          self._debug_prefix,
+          exc_info=True,
+      )
+
+  def _record_agent_step(
+      self,
+      step: Optional[agent_types.Step],
+  ) -> None:
+    """Writes an agent turn step (2*i + 1) live to trajectory_store."""
+    if self.trajectory_store is None or self.metadata is None or step is None:
+      return
+    try:
+      # Use `trajectory.step_idx` (incremented once per `_one_step()` entry)
+      # rather than `len(trajectory.steps)` because `update_from_model()` has
+      # already appended `step` to `trajectory.steps` mid-turn (making
+      # `len(trajectory.steps)` equal to `step_idx + 1`).
+      # TODO(sizhi): Support persisting MoE routed_experts
+      # (prompt_routed_experts, assistant_routed_experts, and
+      # env_routed_experts) in TrajectoryStore in a follow-up CL.
+      agent_step = converter_lib.create_agent_step(
+          step,
+          tunix_step_id=self.agent.trajectory.step_idx,
+          policy_version=self.policy_version,
+      )
+      if agent_step is not None:
+        self._sync_trajectory_metadata()
+        self.trajectory_store.add_step(agent_step, self.metadata)
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.warning(
+          "%s Failed to record agent step in trajectory store.",
+          self._debug_prefix,
+          exc_info=True,
+      )
+
+  def _record_env_step(
+      self,
+      step: Optional[agent_types.Step],
+  ) -> None:
+    """Writes an environment turn step (2*i + 2) live to trajectory_store."""
+    if self.trajectory_store is None or self.metadata is None or step is None:
+      return
+    try:
+      env_step = converter_lib.create_env_step(
+          step, tunix_step_id=self.agent.trajectory.step_idx
+      )
+      if env_step is not None:
+        self._sync_trajectory_metadata()
+        self.trajectory_store.add_step(env_step, self.metadata)
+    except Exception:  # pylint: disable=broad-exception-caught
+      logging.warning(
+          "%s Failed to record env step in trajectory store.",
+          self._debug_prefix,
+          exc_info=True,
+      )
+
   async def collect(self, mode: str = "Conversation") -> Any:
     """Execute a complete rollout episode and return the resulting trajectory.
 
@@ -247,6 +387,7 @@ class TrajectoryCollectEngine:
 
       self.agent.trajectory.status = agent_types.TrajectoryStatus.RUNNING
       self._logged_clip_reasons.clear()
+      self._record_task_step()
 
       while True:
         if len(self.agent.trajectory.steps) >= self.max_steps:
@@ -268,16 +409,7 @@ class TrajectoryCollectEngine:
             )
           break
 
-      self._finalize_terminal_step_routing()
-
-      masked_out = (
-          self.overlong_filter
-          and self.agent.trajectory.status in self.filter_statuses
-      )
-      if not masked_out:
-        await self._append_final_reward()
-      self.compute_mc_reward()
-      self.compute_trajectory_reward()
+      masked_out = await self._post_process_episode()
     except asyncio.TimeoutError:
       self.agent.trajectory.status = agent_types.TrajectoryStatus.TIMEOUT
       raise
@@ -288,7 +420,10 @@ class TrajectoryCollectEngine:
       self.agent.trajectory.status = agent_types.TrajectoryStatus.FAILED
       raise
     finally:
-      await self._close()
+      try:
+        await self._close()
+      finally:
+        self.record_metadata()
 
     if mode not in ["Trajectory", "Steps", "Token", "Conversation"]:
       raise ValueError(
@@ -700,7 +835,11 @@ class TrajectoryCollectEngine:
     # rather than `len(steps)` so it is available before `update_from_model()`.
     self.agent.trajectory.step_idx += 1
     action, cur_step = await self._on_model_interact()
-    return await self._on_env_interact(action, cur_step)
+    self._record_agent_step(cur_step)
+    try:
+      return await self._on_env_interact(action, cur_step)
+    finally:
+      self._record_env_step(cur_step)
 
   async def _on_model_interact(
       self,
@@ -813,6 +952,8 @@ class TrajectoryCollectEngine:
       delta_routed = np.asarray(
           rollout_output.routed_experts[0], dtype=np.int16
       )
+      # TODO(sizhi): Re-record `prev_step` in TrajectoryStore once MoE
+      # routed_experts persistence is supported.
       prev_step = self.agent.trajectory.steps[-1]
       needed_asst = 0
       if (
@@ -1020,6 +1161,30 @@ class TrajectoryCollectEngine:
 
     return done
 
+  async def _post_process_episode(self) -> bool:
+    """Computes episode-level results once the interaction loop ends.
+
+    The final reward is folded into the last step and upserted in the trajectory
+    store so stored step rewards match training rewards.
+
+    Returns:
+      True if the trajectory is masked out by the overlong filter.
+    """
+    # TODO(sizhi): Support persisting MoE routed_experts (including terminal
+    # step padding and multi-turn stitching) in TrajectoryStore in a
+    # follow-up CL.
+    self._finalize_terminal_step_routing()
+
+    masked_out = (
+        self.overlong_filter
+        and self.agent.trajectory.status in self.filter_statuses
+    )
+    if not masked_out:
+      await self._append_final_reward()
+    self.compute_mc_reward()
+    self.compute_trajectory_reward()
+    return masked_out
+
   async def _append_final_reward(self):
     """Compute and add final reward to the last step of the episode.
 
@@ -1041,6 +1206,7 @@ class TrajectoryCollectEngine:
 
     self.reward_time["reward_latency"] += wall_time
     last_step.reward += final_reward
+    self._record_env_step(last_step)
     logging.debug(
         "%s Final reward computed: %s", self._debug_prefix, final_reward
     )
