@@ -7,6 +7,7 @@
 
 1. **Strict Read-Only Protocol Boundary (`TrajectoryReader`)**
    The CLI parses backend store flags (`--store`, `--root_dir`, `--run_id`) via `simple_parsing.subgroups`, builds the store config dict via `build_store_config()`, constructs the selected backend through `store.TrajectoryStore.from_config()`, and passes it to subcommands as a `store.TrajectoryReader`. Subcommands only ever receive a `TrajectoryReader`, guaranteeing that inspection tools cannot mutate or corrupt rollout data or couple to backend-specific storage internals.
+   The global `--metadata_type` flag (default `base`; any registered `TrajectoryMetadata.METADATA_TYPE`, e.g. `tunix`) selects the `TrajectoryMetadata` subclass the store reads trajectories back as. Reading a Tunix run with `--metadata_type tunix` yields `TunixTrajectory` objects whose first-class fields (`total_reward`, `status`, per-step rewards) the commands report; with `base` those fields stay packed in `extra`, and the stats log a warning that suggests the `--metadata_type` to re-run with instead of silently reporting their reward and status as missing.
 
 2. **Dual Output Contract (Human & `--json`)**
    Every subcommand implements `execute(self, reader: store.TrajectoryReader, output_json: bool = False) -> int`.
