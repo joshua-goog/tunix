@@ -53,6 +53,10 @@ spec:
                 trap _sigterm SIGTERM
 
                 (
+                  export JAX_COMPILATION_CACHE_DIR="$${JAX_COMPILATION_CACHE_DIR:-/tmp/jax_cache}"
+                  export VLLM_XLA_CACHE_PATH="$${VLLM_XLA_CACHE_PATH:-$$JAX_COMPILATION_CACHE_DIR}"
+                  mkdir -p "$$JAX_COMPILATION_CACHE_DIR"
+
                   if [ "$$LWS_WORKER_INDEX" = "0" ]; then
                     echo "Starting Ray Head..."
                     ray start --head --port=6379
@@ -60,6 +64,9 @@ spec:
 
                     ${STARTUP_COMMAND}
                   else
+                    if [ -n "$${ROLLOUT_JAX_CACHE_GCS_DIR:-}$${JAX_CACHE_GCS_DIR:-}$${JAX_CACHE_BUCKET:-}$${BUCKET:-}$${MAXTEXT_OUTPUT_DIR:-}" ]; then
+                      python3 -m tunix.experimental.common.gcs_cache download "$$JAX_COMPILATION_CACHE_DIR" "$${ROLLOUT_JAX_CACHE_GCS_DIR:-}" || true
+                    fi
                     ray start --address=$${LWS_LEADER_ADDRESS}:6379 --block
                   fi
                 ) & PID=$$!

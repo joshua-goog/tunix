@@ -110,6 +110,10 @@ ${QUEUE_LABEL}spec:
                   echo "Ray head: $${RAY_HEAD}, this pod index: $${POD_INDEX}"
 
                   (
+                    export JAX_COMPILATION_CACHE_DIR="$${JAX_COMPILATION_CACHE_DIR:-/tmp/jax_cache}"
+                    export VLLM_XLA_CACHE_PATH="$${VLLM_XLA_CACHE_PATH:-$$JAX_COMPILATION_CACHE_DIR}"
+                    mkdir -p "$$JAX_COMPILATION_CACHE_DIR"
+
                     if [ "$${POD_INDEX}" = "0" ]; then
                       echo "Starting Ray head..."
                       ray start --head --port=6379
@@ -117,6 +121,9 @@ ${QUEUE_LABEL}spec:
 
                       ${STARTUP_COMMAND}
                     else
+                      if [ -n "$${ROLLOUT_JAX_CACHE_GCS_DIR:-}$${JAX_CACHE_GCS_DIR:-}$${JAX_CACHE_BUCKET:-}$${BUCKET:-}$${MAXTEXT_OUTPUT_DIR:-}" ]; then
+                        python3 -m tunix.experimental.common.gcs_cache download "$$JAX_COMPILATION_CACHE_DIR" "$${ROLLOUT_JAX_CACHE_GCS_DIR:-}" || true
+                      fi
                       # The head may not be up yet; JobSet gives no ordering.
                       until ray start --address=$${RAY_HEAD}:6379 --block; do
                         echo "Ray head $${RAY_HEAD} not ready, retrying in 5s..."

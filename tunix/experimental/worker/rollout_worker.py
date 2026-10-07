@@ -14,6 +14,7 @@
 
 """Top-level RolloutWorker abstractions (Service vs Client Driver)."""
 
+from concurrent import futures
 import dataclasses
 import threading
 from typing import Any, AsyncIterator, Callable, List, Mapping, Optional, Sequence, Union
@@ -21,6 +22,7 @@ from typing import Any, AsyncIterator, Callable, List, Mapping, Optional, Sequen
 from absl import logging
 import numpy as np
 from tunix.experimental.common import datatypes
+from tunix.experimental.common import gcs_cache
 from tunix.experimental.rollout import manager as manager_lib
 from tunix.experimental.rollout import sampler as sampler_lib
 from tunix.experimental.trajectory import store as trajectory_store_lib
@@ -87,6 +89,7 @@ class RolloutWorker(abstract_worker.Worker):
       max_concurrency: int = 64,
       tokenizer: Any = None,
       chat_parser: Any = None,
+      jax_cache_config: Optional[gcs_cache.JaxCacheConfig] = None,
   ):
     super().__init__()
     self.worker_id = worker_id
@@ -95,6 +98,16 @@ class RolloutWorker(abstract_worker.Worker):
     self._state = datatypes.WorkerState.PENDING
     self._init_lock = threading.Lock()
     self._sync_round = {"req_id": None, "uuid": 0, "phase": "idle"}
+    self.jax_cache_config: gcs_cache.JaxCacheConfig = (
+        jax_cache_config
+        if jax_cache_config is not None
+        else gcs_cache.JaxCacheConfig.from_env()
+    )
+    self._pending_jax_cache_sync: tuple[futures.Future[bool], float] | None = (
+        None
+    )
+    self._first_rollout_cache_synced: bool = False
+    self._jax_cache_lock = threading.Lock()
     if tokenizer is None or chat_parser is None:
       raise ValueError(
           "RolloutWorker requires valid tokenizer and chat_parser arguments"
@@ -169,6 +182,120 @@ class RolloutWorker(abstract_worker.Worker):
         }
     )
 
+  def _resolve_jax_cache_gcs_uri(self) -> str | None:
+    """Resolves the target rollout GCS compilation cache URI, if configured."""
+    return (
+        self.jax_cache_config.resolved_gcs_uri or gcs_cache.get_active_gcs_uri()
+    )
+
+  def _await_jax_cache_upload(
+      self, pending: tuple[futures.Future[bool], float]
+  ) -> None:
+    """Waits for a specific JAX cache upload future and logs its outcome."""
+    outcome, sync_timeout_s = pending
+    try:
+      uploaded = outcome.result(timeout=sync_timeout_s)
+    except futures.TimeoutError:
+      logging.warning(
+          "JAX cache upload on rollout worker %s timed out after %.0fs;"
+          " abandoning it.",
+          self.worker_id,
+          sync_timeout_s,
+      )
+      return
+    except Exception as err:  # pylint: disable=broad-except
+      logging.warning(
+          "Failed to sync JAX cache on rollout worker %s: %r",
+          self.worker_id,
+          err,
+      )
+      return
+    if not uploaded:
+      logging.warning(
+          "Rollout worker %s reported a failed JAX cache upload.",
+          self.worker_id,
+      )
+      return
+    logging.info("Rollout worker %s JAX cache upload finished.", self.worker_id)
+
+  def _wait_for_jax_cache_sync(self) -> None:
+    """Waits for any in-flight background JAX cache upload to finish."""
+    with self._jax_cache_lock:
+      pending = self._pending_jax_cache_sync
+      self._pending_jax_cache_sync = None
+    if pending is not None:
+      self._await_jax_cache_upload(pending)
+
+  def sync_jax_cache(
+      self, *, wait: bool = False
+  ) -> futures.Future[bool] | None:
+    """Autonomously synchronizes local JAX compilation cache to GCS on the primary replica.
+
+    Args:
+      wait: If True, blocks until the upload completes (or times out). If False,
+        dispatches the upload on a background daemon thread and returns its
+        Future immediately so rollout critical paths are not blocked.
+
+    Returns:
+      The upload Future when an upload is launched, or None if cache persistence
+      is disabled or this worker is a non-primary replica.
+    """
+    if (
+        not self.jax_cache_config.save_jax_cache
+        or gcs_cache.is_jax_cache_disabled()
+        or not gcs_cache.is_primary_rollout_worker(self.worker_id)
+    ):
+      return None
+    gcs_uri = self._resolve_jax_cache_gcs_uri()
+    if not gcs_uri:
+      return None
+
+    local_dir = self.jax_cache_config.local_dir
+    sync_timeout_s = self.jax_cache_config.sync_timeout_s
+    logging.info(
+        "Triggering autonomous JAX compilation cache upload to GCS (%s) on"
+        " rollout worker %s (wait=%s)...",
+        gcs_uri,
+        self.worker_id,
+        wait,
+    )
+
+    outcome: futures.Future[bool] = futures.Future()
+    with self._jax_cache_lock:
+      prior_pending = self._pending_jax_cache_sync
+      self._pending_jax_cache_sync = (outcome, sync_timeout_s)
+
+    def _run() -> None:
+      if prior_pending is not None:
+        self._await_jax_cache_upload(prior_pending)
+      try:
+        outcome.set_result(
+            gcs_cache.save_jax_cache(gcs_uri=gcs_uri, local_dir=local_dir)
+        )
+      except Exception as err:  # pylint: disable=broad-except
+        outcome.set_exception(err)
+
+    threading.Thread(
+        target=_run,
+        name=f"jax-cache-upload-{self.worker_id}",
+        daemon=True,
+    ).start()
+    if wait:
+      self._wait_for_jax_cache_sync()
+    return outcome
+
+  def _maybe_sync_jax_cache_after_first_rollout(
+      self, response: datatypes.RolloutResponse
+  ) -> None:
+    """Triggers a one-time background cache upload after the first completed rollout."""
+    if response.status != "COMPLETED" or self._first_rollout_cache_synced:
+      return
+    with self._jax_cache_lock:
+      if self._first_rollout_cache_synced:
+        return
+      self._first_rollout_cache_synced = True
+    self.sync_jax_cache(wait=False)
+
   def _ensure_initialized(self) -> None:
     if self.state == WorkerState.PENDING:
       self.initialize()
@@ -201,6 +328,7 @@ class RolloutWorker(abstract_worker.Worker):
     try:
       await self.sampler.start()
       await self.manager.bind_weight_sync()
+      self.sync_jax_cache(wait=False)
       return self._response(started=True)
     except Exception:
       self.state = WorkerState.ERROR
@@ -211,10 +339,13 @@ class RolloutWorker(abstract_worker.Worker):
     try:
       self.manager.cancel_all()
     finally:
-      # Runs even when cancel_all raises, so a failed stop releases the
-      # store's background writer thread instead of leaking it.
-      if self._trajectory_store is not None:
-        self._trajectory_store.close()
+      try:
+        # Runs even when cancel_all raises, so a failed stop releases the
+        # store's background writer thread instead of leaking it.
+        if self._trajectory_store is not None:
+          self._trajectory_store.close()
+      finally:
+        self._wait_for_jax_cache_sync()
     return datatypes.Response()
 
   def pause(self) -> datatypes.Response:
@@ -322,20 +453,29 @@ class RolloutWorker(abstract_worker.Worker):
       cb = lambda item: on_complete(self._to_rollout_response(item))
     res = await self.manager.generate(requests, on_complete=cb)
     if isinstance(res, (list, tuple)):
-      return [self._to_rollout_response(r) for r in res]
-    return self._to_rollout_response(res)
+      responses = [self._to_rollout_response(r) for r in res]
+      for resp in responses:
+        self._maybe_sync_jax_cache_after_first_rollout(resp)
+      return responses
+    resp = self._to_rollout_response(res)
+    self._maybe_sync_jax_cache_after_first_rollout(resp)
+    return resp
 
   async def pop_next_completed(self) -> datatypes.RolloutResponse | Any:
     """Pull-based stream: yields whichever trajectory finishes first out-of-order."""
     res = await self.manager.pop_next_completed()
-    return self._to_rollout_response(res)
+    resp = self._to_rollout_response(res)
+    self._maybe_sync_jax_cache_after_first_rollout(resp)
+    return resp
 
   async def as_completed_stream(
       self,
   ) -> AsyncIterator[datatypes.RolloutResponse | Any]:
     """Async stream yielding completed trajectories or errors strictly out-of-order."""
     async for res in self.manager.as_completed_stream():
-      yield self._to_rollout_response(res)
+      resp = self._to_rollout_response(res)
+      self._maybe_sync_jax_cache_after_first_rollout(resp)
+      yield resp
 
   async def pre_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Quiesces the worker; it stays SYNCING until post or abort."""
